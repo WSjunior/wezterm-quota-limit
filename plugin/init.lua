@@ -38,31 +38,121 @@ local function bright()
   return { Foreground = { Color = "#c0caf5" } }
 end
 
--- Read OAuth token from credentials file
-local function get_token()
+-- Credentials file path
+local function cred_path()
   local home = os.getenv("USERPROFILE") or os.getenv("HOME") or ""
-  local cred_path = home .. "/.claude/.credentials.json"
+  return home .. "/.claude/.credentials.json"
+end
 
-  local f = io.open(cred_path, "r")
+-- Read credentials file
+local function read_credentials()
+  local path = cred_path()
+  local f = io.open(path, "r")
   if not f then
-    -- Try Windows-style path
-    cred_path = home .. "\\.claude\\.credentials.json"
-    f = io.open(cred_path, "r")
+    f = io.open(path:gsub("/", "\\"), "r")
   end
   if not f then
     return nil, "no credentials file"
   end
-
   local content = f:read("*a")
   f:close()
+  return content, nil
+end
 
-  -- Extract accessToken from claudeAiOauth
+-- Read OAuth token from credentials file
+local function get_token()
+  local content, err = read_credentials()
+  if not content then
+    return nil, err
+  end
+
   local token = content:match('"claudeAiOauth"%s*:%s*{[^}]*"accessToken"%s*:%s*"([^"]+)"')
   if not token then
     return nil, "no accessToken in credentials"
   end
 
   return token, nil
+end
+
+-- Read refresh token from credentials file
+local function get_refresh_token()
+  local content, err = read_credentials()
+  if not content then
+    return nil, err
+  end
+
+  local token = content:match('"claudeAiOauth"%s*:%s*{[^}]*"refreshToken"%s*:%s*"([^"]+)"')
+  if not token then
+    return nil, "no refreshToken in credentials"
+  end
+
+  return token, nil
+end
+
+-- Refresh the OAuth token and update credentials file
+local function refresh_oauth_token()
+  local refresh_token, err = get_refresh_token()
+  if not refresh_token then
+    return false, err
+  end
+
+  local payload = '{"grant_type":"refresh_token","refresh_token":"'
+    .. refresh_token
+    .. '","client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e"}'
+
+  local success, stdout, stderr = wezterm.run_child_process({
+    "curl",
+    "-s",
+    "-m", "10",
+    "-w", "\n%{http_code}",
+    "-X", "POST",
+    "https://console.anthropic.com/v1/oauth/token",
+    "-H", "Content-Type: application/json",
+    "-d", payload,
+  })
+
+  if not success or not stdout or stdout == "" then
+    return false, "refresh curl failed"
+  end
+
+  local body, http_code = stdout:match("^(.*)\n(%d+)$")
+  if tonumber(http_code) ~= 200 then
+    return false, "refresh failed (HTTP " .. (http_code or "?") .. ")"
+  end
+
+  local ok, data = pcall(wezterm.json_parse, body)
+  if not ok or not data or not data.access_token then
+    return false, "refresh parse failed"
+  end
+
+  -- Read current credentials and replace tokens
+  local content, read_err = read_credentials()
+  if not content then
+    return false, read_err
+  end
+
+  content = content:gsub(
+    '("accessToken"%s*:%s*")[^"]+(")',
+    "%1" .. data.access_token .. "%2"
+  )
+  content = content:gsub(
+    '("refreshToken"%s*:%s*")[^"]+(")',
+    "%1" .. data.refresh_token .. "%2"
+  )
+
+  local path = cred_path()
+  local f = io.open(path, "w")
+  if not f then
+    f = io.open(path:gsub("/", "\\"), "w")
+  end
+  if not f then
+    return false, "cannot write credentials"
+  end
+  f:write(content)
+  f:close()
+
+  wezterm.log_info("claude-usage: OAuth token refreshed successfully")
+  return true, nil
 end
 
 -- Format time remaining until reset
@@ -108,8 +198,8 @@ local function current_interval()
   if consecutive_errors == 0 then
     return config.poll_interval_secs
   end
-  -- Back off: 2min, 4min, 8min, capped at 10min
-  local backoff = math.min(120 * (2 ^ (consecutive_errors - 1)), 600)
+  -- Back off: 2min, 4min, 8min, 16min, capped at 30min
+  local backoff = math.min(120 * (2 ^ (consecutive_errors - 1)), 1800)
   return backoff
 end
 
@@ -155,18 +245,44 @@ local function fetch_usage()
 
   local status = tonumber(http_code)
 
-  if status == 429 then
+  if status == 429 or status == 401 or status == 403 then
+    -- Try refreshing the token — rate limits are per-token
+    local refreshed, refresh_err = refresh_oauth_token()
+    if refreshed then
+      -- Retry with the new token
+      local new_token = get_token()
+      if new_token then
+        local s2, out2 = wezterm.run_child_process({
+          "curl", "-s", "-m", "5", "-w", "\n%{http_code}",
+          "https://api.anthropic.com/api/oauth/usage",
+          "-H", "Authorization: Bearer " .. new_token,
+          "-H", "anthropic-beta: oauth-2025-04-20",
+          "-H", "Content-Type: application/json",
+        })
+        if s2 and out2 then
+          local b2, c2 = out2:match("^(.*)\n(%d+)$")
+          if b2 and tonumber(c2) == 200 then
+            local ok2, d2 = pcall(wezterm.json_parse, b2)
+            if ok2 and d2 and not d2.error then
+              cached_data = d2
+              last_fetch_time = now
+              consecutive_errors = 0
+              last_error = nil
+              return d2
+            end
+          end
+        end
+      end
+    end
+    -- Refresh failed or retry still failed — back off
     last_fetch_time = now
     consecutive_errors = consecutive_errors + 1
     local wait = current_interval()
-    last_error = string.format("rate limited (retry in %dm)", math.ceil(wait / 60))
-    return cached_data or { error = last_error }
-  end
-
-  if status == 401 or status == 403 then
-    last_fetch_time = now
-    consecutive_errors = consecutive_errors + 1
-    last_error = "token expired — re-auth Claude Code"
+    if status == 429 then
+      last_error = string.format("rate limited (retry in %dm)", math.ceil(wait / 60))
+    else
+      last_error = "token expired — re-auth Claude Code"
+    end
     return cached_data or { error = last_error }
   end
 

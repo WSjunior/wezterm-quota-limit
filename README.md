@@ -59,9 +59,9 @@ quota.apply_to_config(config, {
 
 The plugin reads your Claude Code OAuth token from `~/.claude/.credentials.json` and polls the Anthropic usage API every 60 seconds (configurable). Results are cached between polls. The status bar updates on every WezTerm `update-status` event, but only makes a network request when the cache expires.
 
-### Token auto-refresh
+### Token management
 
-If the API returns a 429 (rate limited), 401, or 403, the plugin automatically refreshes the OAuth token using the refresh token from your credentials file. Rate limits on this endpoint are per-access-token, so a fresh token gets a clean rate limit window. The new tokens are persisted back to `~/.claude/.credentials.json`.
+The plugin re-reads the token from disk on every poll, so it automatically picks up tokens refreshed by Claude Code. On a 429 (rate limited) or 401/403 (auth failure), the plugin refreshes the OAuth token itself to get a fresh rate limit window, then updates `~/.claude/.credentials.json` so Claude Code picks up the new tokens too.
 
 ### Error handling
 

@@ -18,6 +18,7 @@ local last_fetch_time = 0
 local consecutive_errors = 0
 local last_error = nil
 local handler_registered = false
+local cached_token = nil
 
 -- Color thresholds (Tokyo Night palette)
 local function usage_color(pct)
@@ -75,19 +76,20 @@ local function read_credentials()
   return content, nil
 end
 
--- Read OAuth token from credentials file
+-- Read OAuth token and expiry from credentials file
 local function get_token()
   local content, err = read_credentials()
   if not content then
-    return nil, err
+    return nil, nil, err
   end
 
   local token = content:match('"claudeAiOauth"%s*:%s*{[^}]*"accessToken"%s*:%s*"([^"]+)"')
   if not token then
-    return nil, "no accessToken in credentials"
+    return nil, nil, "no accessToken in credentials"
   end
 
-  return token, nil
+  local expires_at = content:match('"expiresAt"%s*:%s*(%d+)')
+  return token, tonumber(expires_at), nil
 end
 
 -- Read refresh token from credentials file
@@ -110,7 +112,9 @@ local function gsub_escape(s)
   return s:gsub("%%", "%%%%")
 end
 
--- Refresh the OAuth token and update credentials file
+-- Refresh the OAuth token and update credentials file.
+-- Only called when the token is expired (expiresAt in the past), so Claude Code
+-- would also need to refresh before its next request — no conflict.
 local function refresh_oauth_token()
   local refresh_token, err = get_refresh_token()
   if not refresh_token then
@@ -146,7 +150,7 @@ local function refresh_oauth_token()
     return false, "refresh parse failed"
   end
 
-  -- Read current credentials and replace tokens
+  -- Read current credentials and replace tokens + expiry
   local content, read_err = read_credentials()
   if not content then
     return false, read_err
@@ -160,6 +164,14 @@ local function refresh_oauth_token()
     '("refreshToken"%s*:%s*")[^"]+(")',
     "%1" .. gsub_escape(data.refresh_token) .. "%2"
   )
+  -- Update expiresAt (seconds from now → milliseconds epoch)
+  if data.expires_in then
+    local new_expiry = math.floor(os.time() * 1000) + (data.expires_in * 1000)
+    content = content:gsub(
+      '("expiresAt"%s*:%s*)%d+',
+      "%1" .. tostring(new_expiry)
+    )
+  end
 
   local path = cred_path()
   local f = io.open(path, "w")
@@ -257,11 +269,33 @@ local function fetch_usage()
     return cached_data or { error = last_error or "waiting..." }
   end
 
-  local token, err = get_token()
+  -- Re-read token from disk each fetch — Claude Code may have refreshed it
+  local token, expires_at, err = get_token()
   if not token then
     last_fetch_time = now
     last_error = err
     return cached_data or { error = err }
+  end
+
+  -- If the token changed on disk (Claude Code refreshed it), reset error state
+  if cached_token and token ~= cached_token then
+    consecutive_errors = 0
+    last_error = nil
+  end
+  cached_token = token
+
+  -- If the token is expired, refresh it before calling the API.
+  -- Safe because Claude Code also needs to refresh before its next request,
+  -- so whoever refreshes first wins and both get the new tokens from disk.
+  local now_ms = math.floor(now * 1000)
+  if expires_at and now_ms >= expires_at then
+    local refreshed = refresh_oauth_token()
+    if refreshed then
+      token = get_token()
+      if token then
+        cached_token = token
+      end
+    end
   end
 
   local body, status, curl_err = call_usage_api(token)
@@ -273,12 +307,13 @@ local function fetch_usage()
     return cached_data or { error = last_error }
   end
 
-  if status == 429 or status == 401 or status == 403 then
-    -- Try refreshing the token — rate limits are per-token
-    local refreshed, refresh_err = refresh_oauth_token()
+  if status == 429 then
+    -- Token isn't expired, just rate limited — try refreshing for a new rate limit window
+    local refreshed = refresh_oauth_token()
     if refreshed then
       local new_token = get_token()
       if new_token then
+        cached_token = new_token
         local body2, status2 = call_usage_api(new_token)
         if body2 and status2 == 200 then
           local ok2, d2 = pcall(wezterm.json_parse, body2)
@@ -292,15 +327,37 @@ local function fetch_usage()
         end
       end
     end
-    -- Refresh failed or retry still failed — back off
+    -- Refresh didn't help — back off
     last_fetch_time = now
     consecutive_errors = consecutive_errors + 1
     local wait = current_interval()
-    if status == 429 then
-      last_error = string.format("rate limited (retry in %dm)", math.ceil(wait / 60))
-    else
-      last_error = "auth failed — re-login to Claude Code"
+    last_error = string.format("rate limited (retry in %dm)", math.ceil(wait / 60))
+    return cached_data or { error = last_error }
+  end
+
+  if status == 401 or status == 403 then
+    -- Auth failed — try refreshing
+    local refreshed = refresh_oauth_token()
+    if refreshed then
+      local new_token = get_token()
+      if new_token then
+        cached_token = new_token
+        local body2, status2 = call_usage_api(new_token)
+        if body2 and status2 == 200 then
+          local ok2, d2 = pcall(wezterm.json_parse, body2)
+          if ok2 and d2 and not d2.error then
+            cached_data = d2
+            last_fetch_time = now
+            consecutive_errors = 0
+            last_error = nil
+            return d2
+          end
+        end
+      end
     end
+    last_fetch_time = now
+    consecutive_errors = consecutive_errors + 1
+    last_error = "auth failed — re-login to Claude Code"
     return cached_data or { error = last_error }
   end
 

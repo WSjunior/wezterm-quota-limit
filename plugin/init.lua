@@ -8,7 +8,6 @@ local config = {
   position = "right", -- "left" or "right"
   icons = {
     bolt = "⚡",
-    clock = "⏱",
     week = "📅",
   },
 }
@@ -18,8 +17,9 @@ local cached_data = nil
 local last_fetch_time = 0
 local consecutive_errors = 0
 local last_error = nil
+local handler_registered = false
 
--- Color thresholds
+-- Color thresholds (Tokyo Night palette)
 local function usage_color(pct)
   if pct >= 80 then
     return { Foreground = { Color = "#f7768e" } } -- red
@@ -36,6 +36,22 @@ end
 
 local function bright()
   return { Foreground = { Color = "#c0caf5" } }
+end
+
+-- Deep merge: t2 values override t1, recurses into nested tables
+local function deep_merge(t1, t2)
+  local result = {}
+  for k, v in pairs(t1) do
+    result[k] = v
+  end
+  for k, v in pairs(t2) do
+    if type(v) == "table" and type(result[k]) == "table" then
+      result[k] = deep_merge(result[k], v)
+    else
+      result[k] = v
+    end
+  end
+  return result
 end
 
 -- Credentials file path
@@ -89,6 +105,11 @@ local function get_refresh_token()
   return token, nil
 end
 
+-- Escape a string for use in a gsub replacement (% is special in Lua replacements)
+local function gsub_escape(s)
+  return s:gsub("%%", "%%%%")
+end
+
 -- Refresh the OAuth token and update credentials file
 local function refresh_oauth_token()
   local refresh_token, err = get_refresh_token()
@@ -121,7 +142,7 @@ local function refresh_oauth_token()
   end
 
   local ok, data = pcall(wezterm.json_parse, body)
-  if not ok or not data or not data.access_token then
+  if not ok or not data or not data.access_token or not data.refresh_token then
     return false, "refresh parse failed"
   end
 
@@ -133,11 +154,11 @@ local function refresh_oauth_token()
 
   content = content:gsub(
     '("accessToken"%s*:%s*")[^"]+(")',
-    "%1" .. data.access_token .. "%2"
+    "%1" .. gsub_escape(data.access_token) .. "%2"
   )
   content = content:gsub(
     '("refreshToken"%s*:%s*")[^"]+(")',
-    "%1" .. data.refresh_token .. "%2"
+    "%1" .. gsub_escape(data.refresh_token) .. "%2"
   )
 
   local path = cred_path()
@@ -203,6 +224,31 @@ local function current_interval()
   return backoff
 end
 
+-- Make an API request to the usage endpoint
+local function call_usage_api(token)
+  local success, stdout, stderr = wezterm.run_child_process({
+    "curl",
+    "-s",
+    "-m", "5",
+    "-w", "\n%{http_code}",
+    "https://api.anthropic.com/api/oauth/usage",
+    "-H", "Authorization: Bearer " .. token,
+    "-H", "anthropic-beta: oauth-2025-04-20",
+    "-H", "Content-Type: application/json",
+  })
+
+  if not success or not stdout or stdout == "" then
+    return nil, nil, "curl failed"
+  end
+
+  local body, http_code = stdout:match("^(.*)\n(%d+)$")
+  if not body then
+    return stdout, nil, nil
+  end
+
+  return body, tonumber(http_code), nil
+end
+
 -- Fetch usage data (synchronous curl call cached at the polling interval)
 local function fetch_usage()
   local now = os.time()
@@ -218,58 +264,30 @@ local function fetch_usage()
     return cached_data or { error = err }
   end
 
-  local success, stdout, stderr = wezterm.run_child_process({
-    "curl",
-    "-s",
-    "-m", "5",
-    "-w", "\n%{http_code}",
-    "https://api.anthropic.com/api/oauth/usage",
-    "-H", "Authorization: Bearer " .. token,
-    "-H", "anthropic-beta: oauth-2025-04-20",
-    "-H", "Content-Type: application/json",
-  })
+  local body, status, curl_err = call_usage_api(token)
 
-  if not success or not stdout or stdout == "" then
+  if curl_err then
     last_fetch_time = now
     consecutive_errors = consecutive_errors + 1
-    last_error = "curl failed"
+    last_error = curl_err
     return cached_data or { error = last_error }
   end
-
-  -- Split response body from HTTP status code appended by -w
-  local body, http_code = stdout:match("^(.*)\n(%d+)$")
-  if not body then
-    body = stdout
-    http_code = nil
-  end
-
-  local status = tonumber(http_code)
 
   if status == 429 or status == 401 or status == 403 then
     -- Try refreshing the token — rate limits are per-token
     local refreshed, refresh_err = refresh_oauth_token()
     if refreshed then
-      -- Retry with the new token
       local new_token = get_token()
       if new_token then
-        local s2, out2 = wezterm.run_child_process({
-          "curl", "-s", "-m", "5", "-w", "\n%{http_code}",
-          "https://api.anthropic.com/api/oauth/usage",
-          "-H", "Authorization: Bearer " .. new_token,
-          "-H", "anthropic-beta: oauth-2025-04-20",
-          "-H", "Content-Type: application/json",
-        })
-        if s2 and out2 then
-          local b2, c2 = out2:match("^(.*)\n(%d+)$")
-          if b2 and tonumber(c2) == 200 then
-            local ok2, d2 = pcall(wezterm.json_parse, b2)
-            if ok2 and d2 and not d2.error then
-              cached_data = d2
-              last_fetch_time = now
-              consecutive_errors = 0
-              last_error = nil
-              return d2
-            end
+        local body2, status2 = call_usage_api(new_token)
+        if body2 and status2 == 200 then
+          local ok2, d2 = pcall(wezterm.json_parse, body2)
+          if ok2 and d2 and not d2.error then
+            cached_data = d2
+            last_fetch_time = now
+            consecutive_errors = 0
+            last_error = nil
+            return d2
           end
         end
       end
@@ -281,7 +299,7 @@ local function fetch_usage()
     if status == 429 then
       last_error = string.format("rate limited (retry in %dm)", math.ceil(wait / 60))
     else
-      last_error = "token expired — re-auth Claude Code"
+      last_error = "auth failed — re-login to Claude Code"
     end
     return cached_data or { error = last_error }
   end
@@ -358,19 +376,28 @@ end
 
 function M.apply_to_config(c, opts)
   if opts then
-    for k, v in pairs(opts) do
-      config[k] = v
-    end
+    config = deep_merge(config, opts)
   end
 
-  wezterm.on("update-status", function(window, pane)
-    local data = fetch_usage()
-    local cells = build_cells(data)
+  -- Guard against duplicate handler registration
+  if handler_registered then
+    return
+  end
+  handler_registered = true
 
-    if config.position == "left" then
-      window:set_left_status(wezterm.format(cells))
-    else
-      window:set_right_status(wezterm.format(cells))
+  wezterm.on("update-status", function(window, pane)
+    local ok, err = pcall(function()
+      local data = fetch_usage()
+      local cells = build_cells(data)
+
+      if config.position == "left" then
+        window:set_left_status(wezterm.format(cells))
+      else
+        window:set_right_status(wezterm.format(cells))
+      end
+    end)
+    if not ok then
+      wezterm.log_error("claude-usage: " .. tostring(err))
     end
   end)
 end

@@ -12,7 +12,7 @@ A WezTerm plugin that shows your Claude API usage quota directly in the terminal
 
 - **5-hour window** — current utilization percentage and time until reset
 - **7-day window** — current utilization percentage and time until reset
-- Color-coded: green (< 50%), yellow (50–79%), red (>= 80%)
+- Color-coded: green (< 50%), yellow (50-79%), red (>= 80%)
 
 ## Prerequisites
 
@@ -50,7 +50,6 @@ quota.apply_to_config(config, {
   position = "left",         -- "left" or "right" status bar (default: "right")
   icons = {
     bolt = "⚡",              -- prefix icon
-    clock = "⏱",             -- clock icon
     week = "📅",              -- weekly separator icon
   },
 })
@@ -60,7 +59,15 @@ quota.apply_to_config(config, {
 
 The plugin reads your Claude Code OAuth token from `~/.claude/.credentials.json` and polls the Anthropic usage API every 60 seconds (configurable). Results are cached between polls. The status bar updates on every WezTerm `update-status` event, but only makes a network request when the cache expires.
 
-If the credentials file is missing or the API call fails, the status bar shows an error message in red instead of usage data.
+### Token auto-refresh
+
+If the API returns a 429 (rate limited), 401, or 403, the plugin automatically refreshes the OAuth token using the refresh token from your credentials file. Rate limits on this endpoint are per-access-token, so a fresh token gets a clean rate limit window. The new tokens are persisted back to `~/.claude/.credentials.json`.
+
+### Error handling
+
+- **Exponential backoff** on consecutive errors: 2min, 4min, 8min, 16min, capped at 30min. Resets to normal polling on success.
+- **Stale data preservation** — if a fetch fails but previous data exists, the last successful result is shown (not an error).
+- **Crash protection** — the status bar handler is wrapped in `pcall` so an unexpected error won't break your WezTerm status bar.
 
 ## License
 

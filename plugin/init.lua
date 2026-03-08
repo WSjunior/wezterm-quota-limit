@@ -16,6 +16,8 @@ local config = {
 -- Cached usage data
 local cached_data = nil
 local last_fetch_time = 0
+local consecutive_errors = 0
+local last_error = nil
 
 -- Color thresholds
 local function usage_color(pct)
@@ -101,22 +103,36 @@ local function time_until(reset_str)
   end
 end
 
+-- Calculate how long to wait before next fetch (exponential backoff on errors)
+local function current_interval()
+  if consecutive_errors == 0 then
+    return config.poll_interval_secs
+  end
+  -- Back off: 2min, 4min, 8min, capped at 10min
+  local backoff = math.min(120 * (2 ^ (consecutive_errors - 1)), 600)
+  return backoff
+end
+
 -- Fetch usage data (synchronous curl call cached at the polling interval)
 local function fetch_usage()
   local now = os.time()
-  if cached_data and (now - last_fetch_time) < config.poll_interval_secs then
-    return cached_data
+  local interval = current_interval()
+  if (now - last_fetch_time) < interval then
+    return cached_data or { error = last_error or "waiting..." }
   end
 
   local token, err = get_token()
   if not token then
-    return { error = err }
+    last_fetch_time = now
+    last_error = err
+    return cached_data or { error = err }
   end
 
   local success, stdout, stderr = wezterm.run_child_process({
     "curl",
     "-s",
     "-m", "5",
+    "-w", "\n%{http_code}",
     "https://api.anthropic.com/api/oauth/usage",
     "-H", "Authorization: Bearer " .. token,
     "-H", "anthropic-beta: oauth-2025-04-20",
@@ -125,22 +141,55 @@ local function fetch_usage()
 
   if not success or not stdout or stdout == "" then
     last_fetch_time = now
-    return cached_data or { error = "curl failed" }
+    consecutive_errors = consecutive_errors + 1
+    last_error = "curl failed"
+    return cached_data or { error = last_error }
   end
 
-  local ok, data = pcall(wezterm.json_parse, stdout)
+  -- Split response body from HTTP status code appended by -w
+  local body, http_code = stdout:match("^(.*)\n(%d+)$")
+  if not body then
+    body = stdout
+    http_code = nil
+  end
+
+  local status = tonumber(http_code)
+
+  if status == 429 then
+    last_fetch_time = now
+    consecutive_errors = consecutive_errors + 1
+    local wait = current_interval()
+    last_error = string.format("rate limited (retry in %dm)", math.ceil(wait / 60))
+    return cached_data or { error = last_error }
+  end
+
+  if status == 401 or status == 403 then
+    last_fetch_time = now
+    consecutive_errors = consecutive_errors + 1
+    last_error = "token expired — re-auth Claude Code"
+    return cached_data or { error = last_error }
+  end
+
+  local ok, data = pcall(wezterm.json_parse, body)
   if not ok or not data then
     last_fetch_time = now
-    return cached_data or { error = "parse failed" }
+    consecutive_errors = consecutive_errors + 1
+    last_error = "parse failed"
+    return cached_data or { error = last_error }
   end
 
   if data.error then
     last_fetch_time = now
-    return cached_data or { error = data.error.message or "api error" }
+    consecutive_errors = consecutive_errors + 1
+    last_error = data.error.message or "api error"
+    return cached_data or { error = last_error }
   end
 
+  -- Success — reset error state
   cached_data = data
   last_fetch_time = now
+  consecutive_errors = 0
+  last_error = nil
   return data
 end
 

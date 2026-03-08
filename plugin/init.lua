@@ -124,15 +124,18 @@ local function fetch_usage()
   })
 
   if not success or not stdout or stdout == "" then
+    last_fetch_time = now
     return cached_data or { error = "curl failed" }
   end
 
   local ok, data = pcall(wezterm.json_parse, stdout)
   if not ok or not data then
+    last_fetch_time = now
     return cached_data or { error = "parse failed" }
   end
 
   if data.error then
+    last_fetch_time = now
     return cached_data or { error = data.error.message or "api error" }
   end
 

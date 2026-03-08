@@ -28,7 +28,7 @@ Add to your `~/.wezterm.lua`:
 local wezterm = require("wezterm")
 local config = wezterm.config_builder()
 
-local quota = wezterm.plugin.require("https://github.com/edengibson/wezterm-quota-limit")
+local quota = wezterm.plugin.require("https://github.com/EdenGibson/wezterm-quota-limit")
 quota.apply_to_config(config)
 
 return config

@@ -20,6 +20,10 @@ local last_error = nil
 local handler_registered = false
 local cached_token = nil
 
+-- Burn rate tracking
+local usage_history = {} -- array of {time, five, seven}
+local MAX_HISTORY = 10
+
 -- Color thresholds (Tokyo Night palette)
 local function usage_color(pct)
   if pct >= 80 then
@@ -130,6 +134,79 @@ local function time_until(reset_str)
   end
 end
 
+-- Record a successful usage reading for burn rate calculation
+local function record_usage(data)
+  if not data or data.error then
+    return
+  end
+  local five = data.five_hour and data.five_hour.utilization or 0
+  local seven = data.seven_day and data.seven_day.utilization or 0
+  table.insert(usage_history, { time = os.time(), five = five, seven = seven })
+  while #usage_history > MAX_HISTORY do
+    table.remove(usage_history, 1)
+  end
+end
+
+-- Estimate seconds until a usage field hits 100%, or nil if not increasing
+local function estimate_cap_secs(field)
+  if #usage_history < 2 then
+    return nil
+  end
+  local newest = usage_history[#usage_history]
+  -- Walk backward to find the oldest reading that's still part of a
+  -- continuous increase (skip readings from before a window reset)
+  local start_idx = #usage_history
+  for i = #usage_history - 1, 1, -1 do
+    if usage_history[i][field] > newest[field] then
+      break
+    end
+    start_idx = i
+  end
+  if start_idx >= #usage_history then
+    return nil
+  end
+  local oldest = usage_history[start_idx]
+  local dt = newest.time - oldest.time
+  if dt <= 0 then
+    return nil
+  end
+  local dp = newest[field] - oldest[field]
+  if dp <= 0 then
+    return nil
+  end
+  local remaining = 100 - newest[field]
+  if remaining <= 0 then
+    return 0
+  end
+  return remaining / (dp / dt)
+end
+
+-- Format seconds-to-cap as a short string
+local function format_cap_time(secs)
+  if secs <= 0 then
+    return "now"
+  elseif secs < 60 then
+    return "<1m"
+  elseif secs < 3600 then
+    return string.format("~%dm", math.floor(secs / 60))
+  elseif secs < 86400 then
+    return string.format("~%dh%dm", math.floor(secs / 3600), math.floor((secs % 3600) / 60))
+  else
+    return ">1d"
+  end
+end
+
+-- Color for burn rate based on urgency
+local function cap_color(secs)
+  if secs < 1800 then
+    return { Foreground = { Color = "#f7768e" } } -- red: <30m
+  elseif secs < 3600 then
+    return { Foreground = { Color = "#e0af68" } } -- yellow: <1h
+  else
+    return dim()
+  end
+end
+
 -- Calculate how long to wait before next fetch (exponential backoff on errors)
 local function current_interval()
   if consecutive_errors == 0 then
@@ -235,11 +312,12 @@ local function fetch_usage()
     return cached_data or { error = last_error }
   end
 
-  -- Success — reset error state
+  -- Success — reset error state and record for burn rate
   cached_data = data
   last_fetch_time = now
   consecutive_errors = 0
   last_error = nil
+  record_usage(data)
   return data
 end
 
@@ -267,6 +345,10 @@ local function build_cells(data)
   table.insert(cells, dim())
   table.insert(cells, { Text = " " .. config.icons.bolt .. " " })
 
+  -- Burn rate estimates
+  local five_cap = estimate_cap_secs("five")
+  local seven_cap = estimate_cap_secs("seven")
+
   -- 5h usage
   table.insert(cells, bright())
   table.insert(cells, { Text = "5h " })
@@ -274,6 +356,10 @@ local function build_cells(data)
   table.insert(cells, { Text = string.format("%.0f%%", five_pct) })
   table.insert(cells, dim())
   table.insert(cells, { Text = " (" .. time_until(five_reset) .. ")" })
+  if five_cap then
+    table.insert(cells, cap_color(five_cap))
+    table.insert(cells, { Text = " cap " .. format_cap_time(five_cap) })
+  end
 
   -- Separator
   table.insert(cells, dim())
@@ -285,7 +371,12 @@ local function build_cells(data)
   table.insert(cells, usage_color(seven_pct))
   table.insert(cells, { Text = string.format("%.0f%%", seven_pct) })
   table.insert(cells, dim())
-  table.insert(cells, { Text = " (" .. time_until(seven_reset) .. ") " })
+  table.insert(cells, { Text = " (" .. time_until(seven_reset) .. ")" })
+  if seven_cap then
+    table.insert(cells, cap_color(seven_cap))
+    table.insert(cells, { Text = " cap " .. format_cap_time(seven_cap) })
+  end
+  table.insert(cells, { Text = " " })
 
   return cells
 end

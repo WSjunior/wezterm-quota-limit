@@ -55,6 +55,10 @@ quota.apply_to_config(config, {
 })
 ```
 
+## Type Annotations
+
+Lua LSP types are available via [wezterm-types](https://github.com/DrKJeff16/wezterm-types).
+
 ## How it works
 
 The plugin reads your Claude Code OAuth token from `~/.claude/.credentials.json` and polls the Anthropic usage API every 60 seconds (configurable). Results are cached between polls. The status bar updates on every WezTerm `update-status` event, but only makes a network request when the cache expires.

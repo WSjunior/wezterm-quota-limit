@@ -6,6 +6,7 @@ local M = {}
 local config = {
   poll_interval_secs = 60,
   position = "right", -- "left" or "right"
+  dashboard_key = { key = "u", mods = "CTRL|SHIFT" }, -- keybind to open dashboard
   icons = {
     bolt = "⚡",
     week = "▪",
@@ -346,6 +347,9 @@ local function fetch_usage()
   return data
 end
 
+-- Dashboard URL
+local DASHBOARD_URL = "https://console.anthropic.com/settings/usage"
+
 -- Build status bar cells
 local function build_cells(data)
   local cells = {}
@@ -409,6 +413,22 @@ end
 function M.apply_to_config(c, opts)
   if opts then
     config = deep_merge(config, opts)
+  end
+
+  -- Add keybinding to open usage dashboard
+  if config.dashboard_key then
+    local act = wezterm.action
+    local keys = c.keys or {}
+    table.insert(keys, {
+      key = config.dashboard_key.key,
+      mods = config.dashboard_key.mods,
+      action = act.EmitEvent("open-claude-dashboard"),
+    })
+    c.keys = keys
+
+    wezterm.on("open-claude-dashboard", function()
+      wezterm.open_with(DASHBOARD_URL)
+    end)
   end
 
   -- Guard against duplicate handler registration

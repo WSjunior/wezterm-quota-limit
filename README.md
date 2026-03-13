@@ -7,11 +7,12 @@ A WezTerm plugin that shows your Claude API usage quota directly in the terminal
 ## What it shows
 
 ```
-⚡ 5h 42%  (2h31m)  📅 7d 18%  (4d12h)
+⚡ 5h 42% (2h31m) cap ~3h12m  | 7d 18% (4d12h)
 ```
 
 - **5-hour window** — current utilization percentage and time until reset
 - **7-day window** — current utilization percentage and time until reset
+- **Burn rate** — estimated time until you hit 100% ("cap"), based on recent usage trend
 - Color-coded: green (< 50%), yellow (50-79%), red (>= 80%)
 
 ## Prerequisites
@@ -50,7 +51,7 @@ quota.apply_to_config(config, {
   position = "left",         -- "left" or "right" status bar (default: "right")
   icons = {
     bolt = "⚡",              -- prefix icon
-    week = "📅",              -- weekly separator icon
+    week = "▪",               -- separator before 7-day window
   },
 })
 ```
@@ -65,7 +66,11 @@ The plugin reads your Claude Code OAuth token from `~/.claude/.credentials.json`
 
 ### Token management
 
-The plugin re-reads the token from disk on every poll, so it automatically picks up tokens refreshed by Claude Code. On a 429 (rate limited) or 401/403 (auth failure), the plugin refreshes the OAuth token itself to get a fresh rate limit window, then updates `~/.claude/.credentials.json` so Claude Code picks up the new tokens too.
+The plugin re-reads the token from disk on every poll, so it automatically picks up tokens refreshed by Claude Code. If the token has expired or auth fails (401/403), it waits for Claude Code to refresh the credentials rather than attempting its own token refresh. When it detects a new token on disk, error state resets and normal polling resumes.
+
+### Burn rate estimates
+
+The plugin tracks the last 10 successful usage readings and calculates a linear burn rate. If usage is increasing, it estimates how long until you hit 100% capacity ("cap") for each window. The cap indicator is color-coded by urgency: red (< 30 min), yellow (< 1 hour), dim (> 1 hour).
 
 ### Error handling
 

@@ -8,7 +8,7 @@ local config = {
   position = "right", -- "left" or "right"
   icons = {
     bolt = "⚡",
-    week = "📅",
+    week = "▪",
   },
 }
 

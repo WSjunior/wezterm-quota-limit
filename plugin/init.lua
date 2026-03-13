@@ -217,6 +217,30 @@ local function current_interval()
   return backoff
 end
 
+-- Detect Claude Code version (cached after first call)
+local claude_version = nil
+local function get_claude_version()
+  if claude_version then
+    return claude_version
+  end
+  local ok, stdout = pcall(function()
+    local success, out = wezterm.run_child_process({ "claude", "--version" })
+    if success and out then
+      return out
+    end
+    return nil
+  end)
+  if ok and stdout then
+    local ver = stdout:match("(%d+%.%d+%.%d+)")
+    if ver then
+      claude_version = ver
+      return claude_version
+    end
+  end
+  claude_version = "0.0.0"
+  return claude_version
+end
+
 -- Make an API request to the usage endpoint
 local function call_usage_api(token)
   local success, stdout, stderr = wezterm.run_child_process({
@@ -228,6 +252,7 @@ local function call_usage_api(token)
     "-H", "Authorization: Bearer " .. token,
     "-H", "anthropic-beta: oauth-2025-04-20",
     "-H", "Content-Type: application/json",
+    "-H", "User-Agent: claude-code/" .. get_claude_version(),
   })
 
   if not success or not stdout or stdout == "" then

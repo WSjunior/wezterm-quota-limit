@@ -25,7 +25,32 @@ local cached_token = nil
 local usage_history = {} -- array of {time, five, seven}
 local MAX_HISTORY = 10
 
+-- ANSI escape helpers (bypass wezterm.format to avoid nightly deserialization bugs)
+local ESC = "\x1b["
+local RESET = ESC .. "0m"
+
+local function hex_to_fg(hex)
+  local r = tonumber(hex:sub(2, 3), 16)
+  local g = tonumber(hex:sub(4, 5), 16)
+  local b = tonumber(hex:sub(6, 7), 16)
+  return ESC .. "38;2;" .. r .. ";" .. g .. ";" .. b .. "m"
+end
+
 -- Color thresholds (Tokyo Night palette)
+local function usage_color_esc(pct)
+  if pct >= 80 then
+    return hex_to_fg("#f7768e") -- red
+  elseif pct >= 50 then
+    return hex_to_fg("#e0af68") -- yellow
+  else
+    return hex_to_fg("#9ece6a") -- green
+  end
+end
+
+local DIM = hex_to_fg("#565f89")
+local BRIGHT = hex_to_fg("#c0caf5")
+
+-- Legacy FormatItem helpers (kept for compatibility if wezterm.format works)
 local function usage_color(pct)
   if pct >= 80 then
     return { Foreground = { Color = "#f7768e" } } -- red
@@ -208,6 +233,16 @@ local function cap_color(secs)
   end
 end
 
+local function cap_color_esc(secs)
+  if secs < 1800 then
+    return hex_to_fg("#f7768e")
+  elseif secs < 3600 then
+    return hex_to_fg("#e0af68")
+  else
+    return DIM
+  end
+end
+
 -- Calculate how long to wait before next fetch (exponential backoff on errors)
 local function current_interval()
   if consecutive_errors == 0 then
@@ -350,7 +385,42 @@ end
 -- Dashboard URL
 local DASHBOARD_URL = "https://console.anthropic.com/settings/usage"
 
--- Build status bar cells
+-- Build status string using raw ANSI escapes (avoids wezterm.format deserialization issues)
+local function build_status_string(data)
+  if data.error then
+    return DIM .. " " .. config.icons.bolt .. " Claude: "
+      .. hex_to_fg("#f7768e") .. tostring(data.error) .. " " .. RESET
+  end
+
+  local five_pct = data.five_hour and data.five_hour.utilization or 0
+  local five_reset = data.five_hour and data.five_hour.resets_at
+  local seven_pct = data.seven_day and data.seven_day.utilization or 0
+  local seven_reset = data.seven_day and data.seven_day.resets_at
+  local five_cap = estimate_cap_secs("five")
+  local seven_cap = estimate_cap_secs("seven")
+
+  local s = DIM .. " " .. config.icons.bolt .. " "
+    .. BRIGHT .. "5h "
+    .. usage_color_esc(five_pct) .. string.format("%.0f%%", five_pct)
+    .. DIM .. " (" .. time_until(five_reset) .. ")"
+
+  if five_cap then
+    s = s .. cap_color_esc(five_cap) .. " cap " .. format_cap_time(five_cap)
+  end
+
+  s = s .. DIM .. "  " .. config.icons.week .. " "
+    .. BRIGHT .. "7d "
+    .. usage_color_esc(seven_pct) .. string.format("%.0f%%", seven_pct)
+    .. DIM .. " (" .. time_until(seven_reset) .. ")"
+
+  if seven_cap then
+    s = s .. cap_color_esc(seven_cap) .. " cap " .. format_cap_time(seven_cap)
+  end
+
+  return s .. " " .. RESET
+end
+
+-- Build status bar cells (legacy, for wezterm.format)
 local function build_cells(data)
   local cells = {}
 
@@ -440,12 +510,12 @@ function M.apply_to_config(c, opts)
   wezterm.on("update-status", function(window, pane)
     local ok, err = pcall(function()
       local data = fetch_usage()
-      local cells = build_cells(data)
+      local status = build_status_string(data)
 
       if config.position == "left" then
-        window:set_left_status(wezterm.format(cells))
+        window:set_left_status(status)
       else
-        window:set_right_status(wezterm.format(cells))
+        window:set_right_status(status)
       end
     end)
     if not ok then

@@ -249,8 +249,9 @@ local function current_interval()
     return config.poll_interval_secs
   end
   -- Back off: 2min, 4min, 8min, 16min, capped at 30min
+  -- Never back off below the configured poll interval
   local backoff = math.min(120 * (2 ^ (consecutive_errors - 1)), 1800)
-  return backoff
+  return math.max(config.poll_interval_secs, backoff)
 end
 
 -- Detect Claude Code version (cached after first call)
@@ -392,23 +393,11 @@ local function build_status_string(data)
       .. hex_to_fg("#f7768e") .. tostring(data.error) .. " " .. RESET
   end
 
-  local five_pct = data.five_hour and data.five_hour.utilization or 0
-  local five_reset = data.five_hour and data.five_hour.resets_at
   local seven_pct = data.seven_day and data.seven_day.utilization or 0
   local seven_reset = data.seven_day and data.seven_day.resets_at
-  local five_cap = estimate_cap_secs("five")
   local seven_cap = estimate_cap_secs("seven")
 
   local s = DIM .. " " .. config.icons.bolt .. " "
-    .. BRIGHT .. "5h "
-    .. usage_color_esc(five_pct) .. string.format("%.0f%%", five_pct)
-    .. DIM .. " (" .. time_until(five_reset) .. ")"
-
-  if five_cap then
-    s = s .. cap_color_esc(five_cap) .. " cap " .. format_cap_time(five_cap)
-  end
-
-  s = s .. DIM .. "  " .. config.icons.week .. " "
     .. BRIGHT .. "7d "
     .. usage_color_esc(seven_pct) .. string.format("%.0f%%", seven_pct)
     .. DIM .. " (" .. time_until(seven_reset) .. ")"
@@ -432,10 +421,6 @@ local function build_cells(data)
     return cells
   end
 
-  -- 5-hour window
-  local five_pct = data.five_hour and data.five_hour.utilization or 0
-  local five_reset = data.five_hour and data.five_hour.resets_at
-
   -- 7-day window
   local seven_pct = data.seven_day and data.seven_day.utilization or 0
   local seven_reset = data.seven_day and data.seven_day.resets_at
@@ -444,25 +429,8 @@ local function build_cells(data)
   table.insert(cells, dim())
   table.insert(cells, { Text = " " .. config.icons.bolt .. " " })
 
-  -- Burn rate estimates
-  local five_cap = estimate_cap_secs("five")
+  -- Burn rate estimate
   local seven_cap = estimate_cap_secs("seven")
-
-  -- 5h usage
-  table.insert(cells, bright())
-  table.insert(cells, { Text = "5h " })
-  table.insert(cells, usage_color(five_pct))
-  table.insert(cells, { Text = string.format("%.0f%%", five_pct) })
-  table.insert(cells, dim())
-  table.insert(cells, { Text = " (" .. time_until(five_reset) .. ")" })
-  if five_cap then
-    table.insert(cells, cap_color(five_cap))
-    table.insert(cells, { Text = " cap " .. format_cap_time(five_cap) })
-  end
-
-  -- Separator
-  table.insert(cells, dim())
-  table.insert(cells, { Text = "  " .. config.icons.week .. " " })
 
   -- 7d usage
   table.insert(cells, bright())

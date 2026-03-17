@@ -13,8 +13,29 @@ local config = {
   },
 }
 
--- Cached usage data
-local cached_data = nil
+-- Disk cache path (survives restarts)
+local CACHE_FILE = (os.getenv("USERPROFILE") or os.getenv("HOME") or "") .. "/.wezterm-quota-cache.json"
+
+local function save_cache(data)
+  local f = io.open(CACHE_FILE, "w") or io.open(CACHE_FILE:gsub("/", "\\"), "w")
+  if f then
+    f:write(wezterm.json_encode(data))
+    f:close()
+  end
+end
+
+local function load_cache()
+  local f = io.open(CACHE_FILE, "r") or io.open(CACHE_FILE:gsub("/", "\\"), "r")
+  if not f then return nil end
+  local content = f:read("*a")
+  f:close()
+  local ok, data = pcall(wezterm.json_parse, content)
+  if ok and data and not data.error then return data end
+  return nil
+end
+
+-- Cached usage data (pre-loaded from disk)
+local cached_data = load_cache()
 local last_fetch_time = 0
 local consecutive_errors = 0
 local last_error = nil
@@ -374,8 +395,9 @@ local function fetch_usage()
     return cached_data or { error = last_error }
   end
 
-  -- Success — reset error state and record for burn rate
+  -- Success — reset error state, persist to disk and record for burn rate
   cached_data = data
+  save_cache(data)
   last_fetch_time = now
   consecutive_errors = 0
   last_error = nil
@@ -389,8 +411,8 @@ local DASHBOARD_URL = "https://console.anthropic.com/settings/usage"
 -- Build status string using raw ANSI escapes (avoids wezterm.format deserialization issues)
 local function build_status_string(data)
   if data.error then
-    return DIM .. " " .. config.icons.bolt .. " Claude: "
-      .. hex_to_fg("#f7768e") .. tostring(data.error) .. " " .. RESET
+    -- No data at all (never fetched successfully): show neutral placeholder
+    return DIM .. " " .. config.icons.bolt .. " 7d " .. DIM .. "--%" .. RESET
   end
 
   local seven_pct = data.seven_day and data.seven_day.utilization or 0
@@ -415,9 +437,7 @@ local function build_cells(data)
 
   if data.error then
     table.insert(cells, dim())
-    table.insert(cells, { Text = " " .. config.icons.bolt .. " Claude: " })
-    table.insert(cells, { Foreground = { Color = "#f7768e" } })
-    table.insert(cells, { Text = tostring(data.error) .. " " })
+    table.insert(cells, { Text = " " .. config.icons.bolt .. " 7d --% " })
     return cells
   end
 
